@@ -1,0 +1,26 @@
+# Output directories
+example.com/
+fredrikstad-nr.no/
+matpaabordet.no/
+screenshots/
+website_screenshots/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+ENV/
+env/
+
+# Environment files
+.env
+.venv
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
