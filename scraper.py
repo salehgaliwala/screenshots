@@ -3,14 +3,14 @@ import re
 import argparse
 import asyncio
 from datetime import datetime
-from typing import Set, List
-from urllib.parse import urljoin, urlparse
-from playwright.async_api import async_playwright
+from typing import Set, List, Dict
+from urllib.parse import urljoin, urlparse, unquote
+from playwright.async_api import async_playwright, Page, APIRequestContext
 from bs4 import BeautifulSoup
 from PIL import Image, ImageChops, ImageDraw
 
-class WebsiteScreenshotter:
-    def __init__(self, base_url: str):
+class WebsiteCloner:
+    def __init__(self, base_url: str, output_dir: str = None, offline: bool = False):
         self.base_url = base_url.rstrip("/")
         parsed_url = urlparse(self.base_url)
         self.domain = parsed_url.netloc
@@ -18,30 +18,180 @@ class WebsiteScreenshotter:
         # Use domain as output root directory (removing www. if present)
         domain_name = self.domain.replace("www.", "")
         if not domain_name:
-            domain_name = "website_screenshots"
+            domain_name = "website_out"
             
-        # Create a timestamped subdirectory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.output_dir = os.path.join(domain_name, timestamp)
+        # Create a timestamped subdirectory if output_dir is not provided
+        if not output_dir:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.output_dir = os.path.join(domain_name, timestamp)
+        else:
+            self.output_dir = output_dir
+
+        self.offline = offline
         self.visited_urls: Set[str] = set()
+        self.assets_dir = os.path.join(self.output_dir, "assets")
+        self.downloaded_assets: Dict[str, str] = {} # remote_url -> local_path
         
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir, exist_ok=True)
             print(f"Created directory: {self.output_dir}")
+        
+        if self.offline and not os.path.exists(self.assets_dir):
+            os.makedirs(self.assets_dir, exist_ok=True)
 
     def is_internal_link(self, url: str) -> bool:
+        if not url:
+            return False
+            
         parsed = urlparse(url)
-        return parsed.netloc == "" or parsed.netloc == self.domain
+        # Only consider http/https or empty scheme (relative)
+        if parsed.scheme and parsed.scheme not in ['http', 'https']:
+            return False
+            
+        # Check if it's a social media or other known external service
+        external_domains = ['facebook.com', 'instagram.com', 'linkedin.com', 'twitter.com', 'youtube.com']
+        if any(domain in parsed.netloc.lower() for domain in external_domains):
+            return False
+            
+        return parsed.netloc == "" or parsed.netloc == self.domain or \
+               parsed.netloc == self.domain.replace("www.", "") or \
+               f"www.{parsed.netloc}" == self.domain
 
-    def clean_filename(self, url: str) -> str:
-        path = urlparse(url).path
+    def clean_filename(self, url: str, is_page: bool = False) -> str:
+        parsed = urlparse(url)
+        path = parsed.path
         if not path or path == "/":
-            return "index"
+            return "index.html" if is_page else "index"
+        
         # Remove leading/trailing slashes and replace others with underscores
         name = path.strip("/").replace("/", "_")
         # Remove any non-alphanumeric characters except underscores and dots
         name = re.sub(r'[^\w\-_.]', '', name)
-        return name if name else "page"
+        
+        if is_page and not name.endswith(".html"):
+            name += ".html"
+            
+        return name if name else ("index.html" if is_page else "page")
+
+    def get_local_asset_path(self, url: str) -> str:
+        """Determines the local path for a given asset URL."""
+        if url in self.downloaded_assets:
+            return self.downloaded_assets[url]
+            
+        parsed = urlparse(url)
+        # Extract filename from path
+        filename = os.path.basename(parsed.path)
+        if not filename:
+            filename = f"asset_{hash(url) % 10000}"
+            
+        # Determine subdirectory based on extension
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in ['.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp']:
+            subdir = "images"
+        elif ext in ['.css']:
+            subdir = "css"
+        elif ext in ['.js']:
+            subdir = "js"
+        elif ext in ['.woff', '.woff2', '.ttf', '.otf', '.eot']:
+            subdir = "fonts"
+        else:
+            subdir = "misc"
+            
+        target_dir = os.path.join(self.assets_dir, subdir)
+        os.makedirs(target_dir, exist_ok=True)
+        
+        # Ensure unique filename
+        local_filename = filename
+        counter = 1
+        while os.path.exists(os.path.join(target_dir, local_filename)):
+            name, ext = os.path.splitext(filename)
+            local_filename = f"{name}_{counter}{ext}"
+            counter += 1
+            
+        rel_path = os.path.join("assets", subdir, local_filename).replace("\\", "/")
+        return rel_path
+
+    async def download_asset(self, url: str, request_context: APIRequestContext) -> str:
+        """Downloads an asset and returns its relative local path."""
+        if url in self.downloaded_assets:
+            return self.downloaded_assets[url]
+            
+        # Skip data URLs
+        if url.startswith('data:'):
+            return url
+            
+        try:
+            rel_path = self.get_local_asset_path(url)
+            abs_path = os.path.join(self.output_dir, rel_path)
+            
+            response = await request_context.get(url)
+            if response.status == 200:
+                with open(abs_path, "wb") as f:
+                    f.write(await response.body())
+                self.downloaded_assets[url] = rel_path
+                return rel_path
+            else:
+                print(f"  Failed to download asset {url}: status {response.status}")
+        except Exception as e:
+            print(f"  Error downloading asset {url}: {e}")
+            
+        return url # Return original URL if download fails
+
+    async def rewrite_urls(self, soup: BeautifulSoup, page_url: str, request_context: APIRequestContext):
+        """Rewrites all internal links and asset sources to be relative."""
+        # 1. Update internal links (<a> tags)
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            if not href or href.startswith(('#', 'javascript:', 'tel:', 'mailto:','data:')):
+                continue
+                
+            full_url = urljoin(page_url, href).split('#')[0].rstrip("/")
+            if self.is_internal_link(full_url):
+                local_name = self.clean_filename(full_url, is_page=True)
+                # If we are in index.html, the link to about.html is just about.html
+                a['href'] = local_name
+
+        # 2. Update images
+        for img in soup.find_all(['img', 'source'], src=True):
+            src = img['src'].strip()
+            full_src = urljoin(page_url, src)
+            local_src = await self.download_asset(full_src, request_context)
+            img['src'] = local_src
+            
+        # Also check srcset
+        for tag in soup.find_all(srcset=True):
+            srcset = tag['srcset']
+            parts = srcset.split(',')
+            new_parts = []
+            for part in parts:
+                subparts = part.strip().split(' ')
+                if subparts:
+                    asset_url = urljoin(page_url, subparts[0])
+                    local_asset = await self.download_asset(asset_url, request_context)
+                    subparts[0] = local_asset
+                    new_parts.append(' '.join(subparts))
+            tag['srcset'] = ', '.join(new_parts)
+
+        # 3. Update scripts
+        for script in soup.find_all('script', src=True):
+            src = script['src'].strip()
+            full_src = urljoin(page_url, src)
+            local_src = await self.download_asset(full_src, request_context)
+            script['src'] = local_src
+
+        # 4. Update stylesheets
+        for link in soup.find_all('link', rel='stylesheet', href=True):
+            href = link['href'].strip()
+            full_href = urljoin(page_url, href)
+            local_href = await self.download_asset(full_href, request_context)
+            link['href'] = local_href
+            
+        # 5. Update other links (icons, etc)
+        for link in soup.find_all('link', rel=re.compile(r'icon|shortcut|apple-touch-icon'), href=True):
+            href = link['href'].strip()
+            full_href = urljoin(page_url, href)
+            local_href = await self.download_asset(full_href, request_context)
+            link['href'] = local_href
 
     async def crawl_and_screenshot(self):
         async with async_playwright() as p:
@@ -64,50 +214,112 @@ class WebsiteScreenshotter:
             links_to_visit = set()
             links_to_visit.add(self.base_url)
 
-            # Look for header and footer tags
-            for container_tag in ['header', 'footer']:
+            # 1. Look for semantic navigation tags
+            for container_tag in ['header', 'footer', 'nav']:
                 containers = soup.find_all(container_tag)
                 for container in containers:
                     for a in container.find_all('a', href=True):
-                        full_url = urljoin(self.base_url, a['href']).split('#')[0].rstrip("/")
+                        href = a['href'].strip()
+                        if not href or href.startswith(('#', 'javascript:', 'tel:', 'mailto:')):
+                            continue
+                        full_url = urljoin(self.base_url, href).split('#')[0].rstrip("/")
                         if self.is_internal_link(full_url):
                             links_to_visit.add(full_url)
 
-            # Manual fallback for common header/footer classes/IDs if no tags found
-            if len(links_to_visit) <= 1:
-                classes_ids = ['header', 'footer', 'nav', 'menu', 'topbar', 'bottombar']
-                for selector in classes_ids:
-                    containers = soup.find_all(attrs={"id": re.compile(selector, re.I)}) + \
-                                soup.find_all(attrs={"class": re.compile(selector, re.I)})
-                    for container in containers:
-                        for a in container.find_all('a', href=True):
-                            full_url = urljoin(self.base_url, a['href']).split('#')[0].rstrip("/")
-                            if self.is_internal_link(full_url):
-                                links_to_visit.add(full_url)
+            # 2. Search for common navigation classes/IDs
+            # This is important because many sites use <div> for menus even if <header> exists
+            nav_selectors = ['header', 'footer', 'nav', 'menu', 'sidebar', 'topbar', 'bottombar', 'navigation']
+            for selector in nav_selectors:
+                # Use regex to find partial matches like "main-menu" or "site-footer"
+                pattern = re.compile(selector, re.I)
+                containers = soup.find_all(attrs={"id": pattern}) + \
+                            soup.find_all(attrs={"class": pattern})
+                for container in containers:
+                    # Avoid redundant searches if we already processed this container via tag
+                    if container.name in ['header', 'footer', 'nav']:
+                        continue
+                    for a in container.find_all('a', href=True):
+                        href = a['href'].strip()
+                        if not href or href.startswith(('#', 'javascript:', 'tel:', 'mailto:')):
+                            continue
+                        full_url = urljoin(self.base_url, href).split('#')[0].rstrip("/")
+                        if self.is_internal_link(full_url):
+                            links_to_visit.add(full_url)
 
-            print(f"Found {len(links_to_visit)} internal links in header/footer.")
+            # Filter out any lingering non-http links just in case
+            links_to_visit = {url for url in links_to_visit if url.startswith('http')}
 
-            for i, url in enumerate(sorted(links_to_visit)):
-                if url in self.visited_urls:
+    async def crawl(self, depth: int = 1):
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
+            request_context = context.request
+            page = await context.new_page()
+
+            print(f"Starting crawl of: {self.base_url} (depth={depth})")
+            
+            queue = [(self.base_url, 0)]
+            to_visit = {self.base_url}
+            
+            while queue:
+                current_url, current_depth = queue.pop(0)
+                if current_url in self.visited_urls:
                     continue
                 
-                print(f"[{i+1}/{len(links_to_visit)}] Taking screenshot of: {url}")
+                print(f"[{len(self.visited_urls)+1}/?] Processing: {current_url} (depth {current_depth})")
                 try:
-                    await page.goto(url, wait_until="networkidle", timeout=60000)
-                    # Add a small delay for any animations/lazy loading
-                    await asyncio.sleep(2)
+                    await page.goto(current_url, wait_until="networkidle", timeout=60000)
+                    await asyncio.sleep(1) # Small delay
                     
-                    filename = f"{self.clean_filename(url)}.png"
+                    # 1. Take Screenshot if requested (default to True if not explicitly offline-only)
+                    # For now, let's always take screenshots if it's the base behavior
+                    filename = f"{self.clean_filename(current_url)}.png"
                     filepath = os.path.join(self.output_dir, filename)
-                    
-                    # Take full page screenshot
                     await page.screenshot(path=filepath, full_page=True)
-                    print(f"  Saved to: {filepath}")
-                    self.visited_urls.add(url)
+                    print(f"  Screenshot saved: {filename}")
+
+                    # 2. Generate Offline Site if enabled
+                    content = await page.content()
+                    soup = BeautifulSoup(content, 'html.parser')
+
+                    if self.offline:
+                        print(f"  Generating offline version...")
+                        await self.rewrite_urls(soup, current_url, request_context)
+                        
+                        local_html_name = self.clean_filename(current_url, is_page=True)
+                        local_html_path = os.path.join(self.output_dir, local_html_name)
+                        
+                        with open(local_html_path, "w", encoding="utf-8") as f:
+                            f.write(soup.prettify())
+                        print(f"  Offline page saved: {local_html_name}")
+
+                    self.visited_urls.add(current_url)
+
+                    # 3. Discover more links if we haven't reached depth limit
+                    if current_depth < depth:
+                        new_links = self.discover_links(soup, current_url)
+                        for link in new_links:
+                            if link not in to_visit:
+                                to_visit.add(link)
+                                queue.append((link, current_depth + 1))
+                                
                 except Exception as e:
-                    print(f"  Failed to capture {url}: {e}")
+                    print(f"  Failed to process {current_url}: {e}")
 
             await browser.close()
+            print(f"Crawl complete. Total pages visited: {len(self.visited_urls)}")
+
+    def discover_links(self, soup: BeautifulSoup, current_url: str) -> Set[str]:
+        """Extracts internal links from a page."""
+        links = set()
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            if not href or href.startswith(('#', 'javascript:', 'tel:', 'mailto:', 'data:')):
+                continue
+            full_url = urljoin(current_url, href).split('#')[0].rstrip("/")
+            if self.is_internal_link(full_url):
+                links.add(full_url)
+        return links
 
 def compare_folders(dir1: str, dir2: str):
     """Compare screenshots in two directories and highlight differences."""
@@ -190,8 +402,11 @@ def compare_folders(dir1: str, dir2: str):
         print(f"Total differences found: {differences_found}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Website Screenshot Crawler and Comparer")
+    parser = argparse.ArgumentParser(description="Website Cloner and Screenshot Tool")
     parser.add_argument("--url", help="Target website URL to crawl")
+    parser.add_argument("--offline", action="store_true", help="Generate an offline version of the site")
+    parser.add_argument("--depth", type=int, default=1, help="Crawl depth (0 for base URL only)")
+    parser.add_argument("--output", help="Output directory name")
     parser.add_argument("--compare", action="store_true", help="Compare two directories of screenshots")
     parser.add_argument("--dir1", help="First directory for comparison")
     parser.add_argument("--dir2", help="Second directory for comparison")
@@ -206,9 +421,10 @@ if __name__ == "__main__":
             if subdirs:
                 print("Available directories:")
                 for d in subdirs:
-                    pts = [sd for sd in os.listdir(d) if os.path.isdir(os.path.join(d, sd))]
-                    for p in pts:
-                        print(f"  {os.path.join(d, p)}")
+                    if os.path.isdir(d):
+                        pts = [sd for sd in os.listdir(d) if os.path.isdir(os.path.join(d, sd))]
+                        for p in pts:
+                            print(f"  {os.path.join(d, p)}")
         else:
             compare_folders(args.dir1, args.dir2)
     else:
@@ -217,5 +433,5 @@ if __name__ == "__main__":
         else:
             target_url = input("Enter the website URL to crawl: ")
 
-        screenshotter = WebsiteScreenshotter(target_url)
-        asyncio.run(screenshotter.crawl_and_screenshot())
+        cloner = WebsiteCloner(target_url, output_dir=args.output, offline=args.offline)
+        asyncio.run(cloner.crawl(depth=args.depth))
